@@ -3,7 +3,7 @@
   "private": true,
   "devDependencies": {
     "@coral-xyz/anchor": "^0.31.0",
-    "@solana/spl-token": "^0.3.11",
+    "@solana/spl-token": "0.4.14",
     "chai": "^4.4.1",
     "mocha": "^10.7.3",
     "ts-mocha": "^10.1.0",

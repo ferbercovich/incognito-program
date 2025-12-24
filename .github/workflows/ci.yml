@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+          cache-dependency-path: incognito-program/yarn.lock
+
+      - name: Install dependencies
+        working-directory: incognito-program
+        run: |
+          yarn install --frozen-lockfile || yarn install
+
+      - name: Install Solana
+        uses: solana-labs/setup-solana@v1
+        with:
+          solana-version: stable
+
+      - name: Install Anchor
+        run: cargo +stable install --git https://github.com/coral-xyz/anchor avm --locked && avm install latest && avm use latest
+
+      - name: Rust fmt + clippy
+        working-directory: incognito-program
+        run: |
+          cargo +stable fmt --all -- --check
+          cargo +stable clippy --all-targets
+
+      - name: Anchor tests (localnet)
+        working-directory: incognito-program
+        run: |
+          anchor test

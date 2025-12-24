@@ -15,7 +15,7 @@ incognito_program = "APQauWUWYf1pd7BwG8xWe2eQT7uhXX4NRnRYQJfnAiYW"
 incognito_program = "APQauWUWYf1pd7BwG8xWe2eQT7uhXX4NRnRYQJfnAiYW"
 
 [provider]
-cluster = "Devnet"
+cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

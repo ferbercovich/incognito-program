@@ -1,7 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token_interface::{
-    self, Mint, TokenAccount, TokenInterface, TransferChecked,
-};
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use groth16_solana::errors::Groth16Error;
 use groth16_solana::groth16::Groth16Verifier;
 
@@ -12,10 +10,24 @@ pub const VAULT_SEED: &[u8] = b"vault";
 pub const NULLIFIER_SEED: &[u8] = b"nullifier";
 pub const NULLIFIER_PAGE_SEED: &[u8] = b"nullifier_page";
 pub const V2_SEED: &[u8] = b"v2";
+
+pub const FR_BYTES: usize = 32;
+pub const GROTH16_PROOF_BYTES: usize = 256;
+pub const GROTH16_A_BYTES: usize = 64;
+pub const GROTH16_B_BYTES: usize = 128;
+pub const GROTH16_C_BYTES: usize = 64;
+pub const ZERO_32: [u8; 32] = [0u8; 32];
 pub const MAX_DEPOSITS_PER_TX: usize = 20;
 pub const ROOT_HISTORY_SIZE: usize = 32;
 // Keep this small enough to avoid Solana BPF stack issues with Anchor account deserialization.
 pub const NULLIFIER_PAGE_CAPACITY: usize = 96;
+
+// BN254 scalar field modulus (Fr) used by Groth16 public inputs (Circom/snarkjs).
+// Hex: 0x30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001
+pub const BN254_FR_MODULUS_BE: [u8; 32] = [
+    48, 100, 78, 114, 225, 49, 160, 41, 184, 80, 69, 182, 129, 129, 88, 93, 40, 51, 232, 72, 121,
+    185, 112, 145, 67, 225, 245, 147, 240, 0, 0, 1,
+];
 
 mod verifying_key;
 mod verifying_key_v2;
@@ -24,6 +36,12 @@ mod verifying_key_v2;
 pub mod incognito_program {
     use super::*;
 
+    /// Initialize a v1 pool for a single mint + fixed denomination.
+    ///
+    /// v1 is a Tornado-style fixed-denomination pool:
+    /// - On-chain stores a single current Merkle root for membership checks
+    /// - Deposits transfer `denomination` tokens per commitment into a PDA-owned vault
+    /// - Withdrawals verify a Groth16 proof and prevent double spends via nullifier PDAs
     pub fn initialize_pool(
         ctx: Context<Initialize>,
         denomination: u64,
@@ -89,13 +107,15 @@ pub mod incognito_program {
             IncognitoError::InvalidMint
         );
 
-        let proof_a: [u8; 64] = proof[0..64]
+        let proof_a: [u8; GROTH16_A_BYTES] = proof[0..GROTH16_A_BYTES]
             .try_into()
             .map_err(|_| IncognitoError::InvalidProof)?;
-        let proof_b: [u8; 128] = proof[64..192]
+        let proof_b: [u8; GROTH16_B_BYTES] = proof
+            [GROTH16_A_BYTES..(GROTH16_A_BYTES + GROTH16_B_BYTES)]
             .try_into()
             .map_err(|_| IncognitoError::InvalidProof)?;
-        let proof_c: [u8; 64] = proof[192..256]
+        let proof_c: [u8; GROTH16_C_BYTES] = proof
+            [(GROTH16_A_BYTES + GROTH16_B_BYTES)..GROTH16_PROOF_BYTES]
             .try_into()
             .map_err(|_| IncognitoError::InvalidProof)?;
 
@@ -168,6 +188,11 @@ pub mod incognito_program {
     // v2: variable-amount notes + change commitments
     // -------------------------
 
+    /// Initialize a v2 pool for a single mint.
+    ///
+    /// v2 uses variable-amount UTXO-style notes. Deposits bind the deposited amount
+    /// to the leaf commitment (see `deposit_v2`), while optional change commitments
+    /// may be appended during `withdraw_v2`.
     pub fn initialize_pool_v2(
         ctx: Context<InitializeV2>,
         initial_root: [u8; 32],
@@ -196,7 +221,8 @@ pub mod incognito_program {
         ctx.accounts.state.merkle_root = new_root;
         let i = ctx.accounts.state.root_history_cursor as usize % ROOT_HISTORY_SIZE;
         ctx.accounts.state.root_history[i] = new_root;
-        ctx.accounts.state.root_history_cursor = ctx.accounts.state.root_history_cursor.wrapping_add(1);
+        ctx.accounts.state.root_history_cursor =
+            ctx.accounts.state.root_history_cursor.wrapping_add(1);
 
         emit!(RootUpdatedEventV2 {
             state: ctx.accounts.state.key(),
@@ -207,11 +233,11 @@ pub mod incognito_program {
         Ok(())
     }
 
-    pub fn deposit_v2(
-        ctx: Context<DepositV2>,
-        commitment: [u8; 32],
-        amount: u64,
-    ) -> Result<()> {
+    /// Deposit a v2 note commitment and transfer the corresponding token amount into the vault.
+    ///
+    /// The program enforces that `amount` matches the low 64 bits of `commitment`.
+    /// This binds deposited tokens to the committed leaf without requiring on-chain hashing.
+    pub fn deposit_v2(ctx: Context<DepositV2>, commitment: [u8; 32], amount: u64) -> Result<()> {
         require_keys_eq!(
             ctx.accounts.mint.key(),
             ctx.accounts.state.mint,
@@ -228,6 +254,28 @@ pub mod incognito_program {
             IncognitoError::InvalidMint
         );
         require!(amount > 0, IncognitoError::InvalidDepositAmount);
+
+        // Deposit-note leaf encoding (v2) binds the deposit token amount into the commitment's low 64 bits.
+        //
+        // Change notes appended during `withdraw_v2` use a different commitment format (Poseidon hash output)
+        // and are not deposited via this instruction.
+        //
+        // Enforce:
+        // - commitment is a canonical Fr field element (required for Poseidon/Merkle membership)
+        // - extracted amountIn == provided `amount`
+        require!(
+            commitment < BN254_FR_MODULUS_BE,
+            IncognitoError::InvalidCommitment
+        );
+        let amount_in = u64::from_be_bytes(
+            commitment[24..32]
+                .try_into()
+                .map_err(|_| IncognitoError::InvalidCommitment)?,
+        );
+        require!(
+            amount_in == amount,
+            IncognitoError::CommitmentAmountMismatch
+        );
 
         token_interface::transfer_checked(
             CpiContext::new(
@@ -300,20 +348,13 @@ pub mod incognito_program {
             IncognitoError::InvalidNullifierShard
         );
 
-        require!(is_known_root(&ctx.accounts.state, &root), IncognitoError::UnknownRoot);
+        require!(
+            is_known_root(&ctx.accounts.state, &root),
+            IncognitoError::UnknownRoot
+        );
 
-        // Groth16 proof split
-        let proof_a: [u8; 64] = proof[0..64]
-            .try_into()
-            .map_err(|_| IncognitoError::InvalidProof)?;
-        let proof_b: [u8; 128] = proof[64..192]
-            .try_into()
-            .map_err(|_| IncognitoError::InvalidProof)?;
-        let proof_c: [u8; 64] = proof[192..256]
-            .try_into()
-            .map_err(|_| IncognitoError::InvalidProof)?;
-
-        let (recipient_lo, recipient_hi) = pubkey_to_u128_halves_le(&ctx.accounts.destination.owner);
+        let (recipient_lo, recipient_hi) =
+            pubkey_to_u128_halves_le(&ctx.accounts.destination.owner);
         let (mint_lo, mint_hi) = pubkey_to_u128_halves_le(&ctx.accounts.state.mint);
 
         let public_inputs: [[u8; 32]; 9] = [
@@ -328,136 +369,22 @@ pub mod incognito_program {
             change_commitment,
         ];
 
-        let mut verifier = Groth16Verifier::<9>::new(
-            &proof_a,
-            &proof_b,
-            &proof_c,
-            &public_inputs,
-            &verifying_key_v2::VERIFYINGKEY,
-        )
-        .map_err(|e| {
-            msg!("groth16 verifier init failed: {}", e);
-            match e {
-                Groth16Error::InvalidG1Length
-                | Groth16Error::InvalidG2Length
-                | Groth16Error::InvalidPublicInputsLength
-                | Groth16Error::PublicInputGreaterThanFieldSize
-                | Groth16Error::IncompatibleVerifyingKeyWithNrPublicInputs => {
-                    IncognitoError::InvalidProof
-                }
-                _ => IncognitoError::Groth16SyscallFailed,
-            }
-        })?;
+        verify_groth16_v2(&proof, &public_inputs)?;
 
-        verifier.verify().map_err(|e| {
-            msg!("groth16 verify failed: {}", e);
-            match e {
-                Groth16Error::ProofVerificationFailed => IncognitoError::InvalidProof,
-                _ => IncognitoError::Groth16SyscallFailed,
-            }
-        })?;
-
-        // Init/validate nullifier shard and page
-        init_or_validate_nullifier_shard(
-            ctx.accounts.nullifier_shard.as_mut(),
-            ctx.accounts.state.key(),
-            nullifier_shard_byte,
-            ctx.bumps.nullifier_shard,
-        )?;
-        let existing_pages = ctx.accounts.nullifier_shard.page_count;
-
-        // Scan for double-spend across all existing pages.
-        let mut last_page_len: Option<u16> = None;
-        for idx in 0..existing_pages {
-            // If the insertion page is part of the existing set, scan it directly (avoid AccountInfo lifetime issues).
-            if idx == nullifier_page_index {
-                let page = ctx.accounts.nullifier_page.load()?;
-                page.validate(ctx.accounts.state.key(), nullifier_shard_byte, idx)?;
-
-                if page.contains(&nullifier_hash) {
-                    return err!(IncognitoError::NullifierAlreadySpent);
-                }
-
-                if idx + 1 == existing_pages {
-                    last_page_len = Some(page.len);
-                }
-                continue;
-            }
-
-            let expected = expected_nullifier_page_pda(
-                ctx.program_id,
-                ctx.accounts.state.key(),
-                nullifier_shard_byte,
-                idx,
-            );
-            let ai = ctx
-                .remaining_accounts
-                .iter()
-                .find(|a| a.key() == expected)
-                .ok_or_else(|| error!(IncognitoError::MissingNullifierPage))?;
-            let (page_len, contains) = nullifier_page_contains_and_len(
-                ai,
-                ctx.accounts.state.key(),
-                nullifier_shard_byte,
-                idx,
-                &nullifier_hash,
-            )?;
-
-            if contains {
-                return err!(IncognitoError::NullifierAlreadySpent);
-            }
-
-            if idx + 1 == existing_pages {
-                last_page_len = Some(page_len);
-            }
-        }
-
-        // Determine insertion page rules (append-only pages)
-        if existing_pages == 0 {
-            require!(nullifier_page_index == 0, IncognitoError::InvalidNullifierPage);
-        } else if nullifier_page_index < existing_pages {
-            // Must write to the current last page.
-            require!(
-                nullifier_page_index + 1 == existing_pages,
-                IncognitoError::InvalidNullifierPage
-            );
-        } else if nullifier_page_index == existing_pages {
-            // Creating a new page requires the previous last page to be full.
-            require!(
-                last_page_len.unwrap_or(0) as usize >= NULLIFIER_PAGE_CAPACITY,
-                IncognitoError::InvalidNullifierPage
-            );
-        } else {
-            return err!(IncognitoError::InvalidNullifierPage);
-        }
-
-        // Init/validate the insertion page, then append.
-        {
-            let mut page = ctx.accounts.nullifier_page.load_mut()?;
-            init_or_validate_nullifier_page(
-                &mut page,
-                ctx.accounts.state.key(),
+        check_and_insert_nullifier_v2(
+            NullifierInsertArgsV2 {
+                program_id: ctx.program_id,
+                state_key: ctx.accounts.state.key(),
+                nullifier_hash: &nullifier_hash,
                 nullifier_shard_byte,
                 nullifier_page_index,
-                ctx.bumps.nullifier_page,
-            )?;
-
-            if page.len as usize >= NULLIFIER_PAGE_CAPACITY {
-                return err!(IncognitoError::NullifierPageFull);
-            }
-
-            // If this is a newly created page, bump shard.page_count.
-            if nullifier_page_index + 1 > ctx.accounts.nullifier_shard.page_count {
-                ctx.accounts.nullifier_shard.page_count = nullifier_page_index + 1;
-            }
-
-            let insert_i = page.len as usize;
-            page.hashes[insert_i] = nullifier_hash;
-            page.len = page
-                .len
-                .checked_add(1)
-                .ok_or(IncognitoError::IndexOverflow)?;
-        }
+                bump_shard: ctx.bumps.nullifier_shard,
+                bump_page: ctx.bumps.nullifier_page,
+            },
+            ctx.accounts.nullifier_shard.as_mut(),
+            ctx.accounts.nullifier_page.as_ref(),
+            ctx.remaining_accounts,
+        )?;
 
         // Transfer funds
         let state_bump = ctx.accounts.state.state_bump;
@@ -502,9 +429,10 @@ pub mod incognito_program {
             )?;
         }
 
-        // Optional change commitment append (tree update happens off-chain via set_root_v2)
+        // Optional change commitment append (tree update happens off-chain via set_root_v2).
+        // Change commitments intentionally do not reveal the note amount (no token transfer accompanies the append).
         let mut change_index: Option<u32> = None;
-        if change_commitment != [0u8; 32] {
+        if change_commitment != ZERO_32 {
             let idx = ctx.accounts.state.next_index;
             ctx.accounts.state.next_index = ctx
                 .accounts
@@ -809,7 +737,8 @@ pub struct WithdrawV2<'info> {
         seeds = [NULLIFIER_PAGE_SEED, state.key().as_ref(), &[nullifier_shard_byte], &nullifier_page_index.to_le_bytes()],
         bump
     )]
-    pub nullifier_page: AccountLoader<'info, NullifierPage>,
+    /// CHECK: Zero-copy `NullifierPage` uses a manual discriminator + bytemuck-based parser to support `init_if_needed`.
+    pub nullifier_page: UncheckedAccount<'info>,
 
     #[account(mut)]
     pub destination: Box<InterfaceAccount<'info, TokenAccount>>,
@@ -896,7 +825,11 @@ impl NullifierPage {
 
     pub fn contains(&self, nullifier_hash: &[u8; 32]) -> bool {
         let n = self.len as usize;
-        let max = if n > NULLIFIER_PAGE_CAPACITY { NULLIFIER_PAGE_CAPACITY } else { n };
+        let max = if n > NULLIFIER_PAGE_CAPACITY {
+            NULLIFIER_PAGE_CAPACITY
+        } else {
+            n
+        };
         for i in 0..max {
             if &self.hashes[i] == nullifier_hash {
                 return true;
@@ -981,6 +914,10 @@ pub enum IncognitoError {
     Groth16SyscallFailed,
     #[msg("Invalid deposit amount (must be > 0).")]
     InvalidDepositAmount,
+    #[msg("Invalid commitment (not a valid BN254 Fr field element).")]
+    InvalidCommitment,
+    #[msg("Commitment amount mismatch (does not match deposit amount).")]
+    CommitmentAmountMismatch,
     #[msg("Unknown Merkle root (not in history).")]
     UnknownRoot,
     #[msg("Invalid nullifier shard (must match nullifier_hash[0]).")]
@@ -993,11 +930,6 @@ pub enum IncognitoError {
     InvalidNullifierPage,
     #[msg("Nullifier page full.")]
     NullifierPageFull,
-}
-
-#[cfg(test)]
-mod tests {
-    // Intentionally empty: devnet-first MVP (no local validator/unit-test harness).
 }
 
 // -------------------------
@@ -1014,6 +946,189 @@ fn is_known_root(state: &IncognitoStateV2, root: &[u8; 32]) -> bool {
         }
     }
     false
+}
+
+fn verify_groth16_v2(
+    proof: &[u8; GROTH16_PROOF_BYTES],
+    public_inputs: &[[u8; 32]; 9],
+) -> Result<()> {
+    let proof_a: [u8; GROTH16_A_BYTES] = proof[0..GROTH16_A_BYTES]
+        .try_into()
+        .map_err(|_| IncognitoError::InvalidProof)?;
+    let proof_b: [u8; GROTH16_B_BYTES] = proof
+        [GROTH16_A_BYTES..(GROTH16_A_BYTES + GROTH16_B_BYTES)]
+        .try_into()
+        .map_err(|_| IncognitoError::InvalidProof)?;
+    let proof_c: [u8; GROTH16_C_BYTES] = proof
+        [(GROTH16_A_BYTES + GROTH16_B_BYTES)..GROTH16_PROOF_BYTES]
+        .try_into()
+        .map_err(|_| IncognitoError::InvalidProof)?;
+
+    let mut verifier = Groth16Verifier::<9>::new(
+        &proof_a,
+        &proof_b,
+        &proof_c,
+        public_inputs,
+        &verifying_key_v2::VERIFYINGKEY,
+    )
+    .map_err(|e| {
+        msg!("groth16 verifier init failed: {}", e);
+        match e {
+            Groth16Error::InvalidG1Length
+            | Groth16Error::InvalidG2Length
+            | Groth16Error::InvalidPublicInputsLength
+            | Groth16Error::PublicInputGreaterThanFieldSize
+            | Groth16Error::IncompatibleVerifyingKeyWithNrPublicInputs => {
+                IncognitoError::InvalidProof
+            }
+            _ => IncognitoError::Groth16SyscallFailed,
+        }
+    })?;
+
+    verifier.verify().map_err(|e| {
+        msg!("groth16 verify failed: {}", e);
+        match e {
+            Groth16Error::ProofVerificationFailed => IncognitoError::InvalidProof,
+            _ => IncognitoError::Groth16SyscallFailed,
+        }
+    })?;
+
+    Ok(())
+}
+
+struct NullifierInsertArgsV2<'a> {
+    program_id: &'a Pubkey,
+    state_key: Pubkey,
+    nullifier_hash: &'a [u8; 32],
+    nullifier_shard_byte: u8,
+    nullifier_page_index: u16,
+    bump_shard: u8,
+    bump_page: u8,
+}
+
+fn check_and_insert_nullifier_v2(
+    args: NullifierInsertArgsV2<'_>,
+    nullifier_shard: &mut Account<'_, NullifierShard>,
+    nullifier_page: &AccountInfo<'_>,
+    remaining_accounts: &[AccountInfo<'_>],
+) -> Result<()> {
+    init_or_validate_nullifier_shard(
+        nullifier_shard,
+        args.state_key,
+        args.nullifier_shard_byte,
+        args.bump_shard,
+    )?;
+    let existing_pages = nullifier_shard.page_count;
+
+    let mut last_page_len: Option<u16> = None;
+    for idx in 0..existing_pages {
+        let (page_len, contains) = if idx == args.nullifier_page_index {
+            nullifier_page_contains_and_len(
+                nullifier_page,
+                args.state_key,
+                args.nullifier_shard_byte,
+                idx,
+                args.nullifier_hash,
+            )?
+        } else {
+            let expected = expected_nullifier_page_pda(
+                args.program_id,
+                args.state_key,
+                args.nullifier_shard_byte,
+                idx,
+            );
+            let ai = remaining_accounts
+                .iter()
+                .find(|a| a.key() == expected)
+                .ok_or_else(|| error!(IncognitoError::MissingNullifierPage))?;
+            nullifier_page_contains_and_len(
+                ai,
+                args.state_key,
+                args.nullifier_shard_byte,
+                idx,
+                args.nullifier_hash,
+            )?
+        };
+        if contains {
+            return err!(IncognitoError::NullifierAlreadySpent);
+        }
+        if idx + 1 == existing_pages {
+            last_page_len = Some(page_len);
+        }
+    }
+
+    if existing_pages == 0 {
+        require!(
+            args.nullifier_page_index == 0,
+            IncognitoError::InvalidNullifierPage
+        );
+    } else if args.nullifier_page_index < existing_pages {
+        require!(
+            args.nullifier_page_index + 1 == existing_pages,
+            IncognitoError::InvalidNullifierPage
+        );
+    } else if args.nullifier_page_index == existing_pages {
+        require!(
+            last_page_len.unwrap_or(0) as usize >= NULLIFIER_PAGE_CAPACITY,
+            IncognitoError::InvalidNullifierPage
+        );
+    } else {
+        return err!(IncognitoError::InvalidNullifierPage);
+    }
+
+    {
+        use anchor_lang::Discriminator;
+        use bytemuck::from_bytes_mut;
+        use core::mem::size_of;
+
+        require!(
+            nullifier_page.is_writable,
+            IncognitoError::InvalidNullifierPage
+        );
+
+        let mut data = nullifier_page.try_borrow_mut_data()?;
+        let disc = NullifierPage::discriminator();
+        require!(
+            data.len() >= (8 + size_of::<NullifierPage>()),
+            IncognitoError::InvalidNullifierPage
+        );
+
+        let given_disc = &data[0..8];
+        let has_disc = given_disc.iter().any(|b| *b != 0);
+        if has_disc {
+            require!(given_disc == disc, IncognitoError::InvalidNullifierPage);
+        } else {
+            data[0..8].copy_from_slice(&disc);
+        }
+
+        let page: &mut NullifierPage =
+            from_bytes_mut(&mut data[8..(8 + size_of::<NullifierPage>())]);
+
+        init_or_validate_nullifier_page(
+            page,
+            args.state_key,
+            args.nullifier_shard_byte,
+            args.nullifier_page_index,
+            args.bump_page,
+        )?;
+
+        if page.len as usize >= NULLIFIER_PAGE_CAPACITY {
+            return err!(IncognitoError::NullifierPageFull);
+        }
+
+        if args.nullifier_page_index + 1 > nullifier_shard.page_count {
+            nullifier_shard.page_count = args.nullifier_page_index + 1;
+        }
+
+        let insert_i = page.len as usize;
+        page.hashes[insert_i] = *args.nullifier_hash;
+        page.len = page
+            .len
+            .checked_add(1)
+            .ok_or(IncognitoError::IndexOverflow)?;
+    }
+
+    Ok(())
 }
 
 fn u64_to_be_bytes32(v: u64) -> [u8; 32] {
@@ -1037,9 +1152,19 @@ fn pubkey_to_u128_halves_le(pk: &Pubkey) -> (u128, u128) {
     (u128::from_le_bytes(lo), u128::from_le_bytes(hi))
 }
 
-fn expected_nullifier_page_pda(program_id: &Pubkey, state: Pubkey, shard: u8, index: u16) -> Pubkey {
+fn expected_nullifier_page_pda(
+    program_id: &Pubkey,
+    state: Pubkey,
+    shard: u8,
+    index: u16,
+) -> Pubkey {
     Pubkey::find_program_address(
-        &[NULLIFIER_PAGE_SEED, state.as_ref(), &[shard], &index.to_le_bytes()],
+        &[
+            NULLIFIER_PAGE_SEED,
+            state.as_ref(),
+            &[shard],
+            &index.to_le_bytes(),
+        ],
         program_id,
     )
     .0
@@ -1059,7 +1184,10 @@ fn init_or_validate_nullifier_shard(
         return Ok(());
     }
     require_keys_eq!(shard.state, state, IncognitoError::InvalidNullifierPage);
-    require!(shard.shard == shard_byte, IncognitoError::InvalidNullifierPage);
+    require!(
+        shard.shard == shard_byte,
+        IncognitoError::InvalidNullifierPage
+    );
     Ok(())
 }
 
@@ -1094,7 +1222,10 @@ fn nullifier_page_contains_and_len(
     let data = ai.data.borrow();
     // NullifierPage field order avoids padding (Pod requirement).
     let header_len = 8 + 32 + 2 + 2 + 1 + 1;
-    require!(data.len() >= header_len, IncognitoError::InvalidNullifierPage);
+    require!(
+        data.len() >= header_len,
+        IncognitoError::InvalidNullifierPage
+    );
     require!(
         data[0..8] == NullifierPage::discriminator(),
         IncognitoError::InvalidNullifierPage
@@ -1114,7 +1245,10 @@ fn nullifier_page_contains_and_len(
     require!(page_index == index, IncognitoError::InvalidNullifierPage);
 
     let len = u16::from_le_bytes(data[len_off..len_off + 2].try_into().unwrap());
-    require!(data[shard_off] == shard, IncognitoError::InvalidNullifierPage);
+    require!(
+        data[shard_off] == shard,
+        IncognitoError::InvalidNullifierPage
+    );
     let max = std::cmp::min(len as usize, NULLIFIER_PAGE_CAPACITY);
     let needed = 8 + core::mem::size_of::<NullifierPage>();
     require!(data.len() >= needed, IncognitoError::InvalidNullifierPage);
@@ -1127,4 +1261,49 @@ fn nullifier_page_contains_and_len(
     }
 
     Ok((len, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_known_root_checks_current_and_history() {
+        let mut s = IncognitoStateV2 {
+            mint: Pubkey::new_unique(),
+            root_updater: Pubkey::new_unique(),
+            merkle_root: [1u8; 32],
+            next_index: 0,
+            root_history: [[0u8; 32]; ROOT_HISTORY_SIZE],
+            root_history_cursor: 0,
+            state_bump: 1,
+            vault_bump: 2,
+        };
+
+        assert!(is_known_root(&s, &[1u8; 32]));
+        assert!(!is_known_root(&s, &[2u8; 32]));
+
+        s.root_history[0] = [9u8; 32];
+        assert!(is_known_root(&s, &[9u8; 32]));
+    }
+
+    #[test]
+    fn test_nullifier_page_contains_respects_len() {
+        let state = Pubkey::new_unique();
+        let mut page = NullifierPage {
+            state,
+            index: 0,
+            len: 2,
+            shard: 7,
+            bump: 255,
+            hashes: [[0u8; 32]; NULLIFIER_PAGE_CAPACITY],
+        };
+        page.hashes[0] = [1u8; 32];
+        page.hashes[1] = [2u8; 32];
+        page.hashes[2] = [3u8; 32];
+
+        assert!(page.contains(&[1u8; 32]));
+        assert!(page.contains(&[2u8; 32]));
+        assert!(!page.contains(&[3u8; 32]));
+    }
 }
