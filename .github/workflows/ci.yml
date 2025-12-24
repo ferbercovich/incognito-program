@@ -18,6 +18,11 @@ jobs:
           cache: yarn
           cache-dependency-path: yarn.lock
 
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
       - name: Install dependencies
         run: |
           yarn install --frozen-lockfile || yarn install
@@ -40,7 +45,12 @@ jobs:
           solana-test-validator --version
 
       - name: Install Anchor
-        run: cargo +stable install --git https://github.com/coral-xyz/anchor avm --locked && avm install latest && avm use latest
+        run: |
+          rustc -vV
+          cargo install --git https://github.com/coral-xyz/anchor avm --locked
+          avm install 0.31.0
+          avm use 0.31.0
+          anchor --version
 
       - name: Rust fmt + clippy
         run: |
